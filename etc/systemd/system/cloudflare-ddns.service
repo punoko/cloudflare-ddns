@@ -1,0 +1,6 @@
+[Unit]
+Description=cloudflare-ddns
+
+[Service]
+EnvironmentFile=/root/.cloudflare-ddns
+ExecStart=/usr/local/bin/cloudflare-ddns

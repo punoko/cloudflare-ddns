@@ -1,0 +1,107 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# the following environment variables are required
+# CF_A_ID
+# CF_AAAA_ID
+# CF_ZONE_ID
+# CF_API_TOKEN
+
+CF_API_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
+CACHE_FILE=/var/cache/$(basename $0).json
+
+patch() {
+    local _record_id=$1
+    local _ip=$2
+    curl --silent --request PATCH \
+        --url "${CF_API_URL}/${_record_id}" \
+        --header "Authorization: Bearer $CF_API_TOKEN" \
+        --header "Content-Type:application/json" \
+        --data "$(jq -nc --arg content $_ip '$ARGS.named')"
+}
+
+output() {
+    local _response=$1
+    echo $_response | jq -r '.result.name,.result.type,.result.content'
+}
+
+message() {
+    local _response=$1
+    echo $_response | jq -cr '.errors[].message'
+}
+
+success() {
+    local _response=$1
+    echo $_response | jq -r '.success'
+}
+
+cache_get_ip() {
+    local _type=$1
+    local _record_id_var=CF_${_type}_ID
+    jq -r --arg record_id "${!_record_id_var}" \
+        '.[$record_id].ip' $CACHE_FILE 2>/dev/null
+}
+
+cache_get_name() {
+    local _type=$1
+    local _record_id_var=CF_${_type}_ID
+    jq -r --arg record_id "${!_record_id_var}" \
+        '.[$record_id].name' $CACHE_FILE 2>/dev/null
+}
+
+cache_set() {
+    local _record_id=$1
+    local _name=$2
+    local _type=$3
+    local _ip=$4
+    local _modified=$(date --iso-8601=seconds)
+    local _json_data=$(cat $CACHE_FILE 2>/dev/null)
+    local _updated_data=$(echo ${_json_data:-null} |
+        jq -S \
+            --arg record_id $_record_id \
+            --arg name $_name \
+            --arg type $_type \
+            --arg ip $_ip \
+            --arg modified $_modified \
+            '.[$record_id] |= {
+                "name": $name,
+                "type": $type,
+                "ip": $ip,
+                "modified": $modified
+                }')
+    echo "$_updated_data" >$CACHE_FILE
+}
+
+update() {
+    local _type=$1
+    local _ip=$2
+    local _record_id_var=CF_${_type}_ID
+    local _response="$(patch ${!_record_id_var} $_ip)" || true
+    if $(success "$_response"); then
+        local _output=($(output "$_response"))
+        cache_set "${!_record_id_var}" ${_output[@]}
+        echo >&2 "updated ${_output[@]}"
+    else
+        local _message=$(message "$_response")
+        echo >&2 "error updating $_type record: ${_message:-unknown}"
+    fi
+}
+
+dig_args="+https +short ch txt whoami.cloudflare @one.one.one.one"
+
+if ! IPv4=$(dig -4 ${dig_args} | tr -d '"'); then
+    echo >&2 "error digging IPv4"
+elif [[ $IPv4 == "$(cache_get_ip A)" ]]; then
+    echo >&2 "cache hit $(cache_get_name A) A $IPv4"
+else
+    update A $IPv4
+fi
+
+if ! IPv6=$(dig -6 ${dig_args} | tr -d '"'); then
+    echo >&2 "error digging IPv6"
+elif [[ $IPv6 == "$(cache_get_ip AAAA)" ]]; then
+    echo >&2 "cache hit $(cache_get_name AAAA) AAAA $IPv6"
+else
+    update AAAA $IPv6
+fi
